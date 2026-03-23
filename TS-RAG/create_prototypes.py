@@ -223,7 +223,6 @@ def iter_patch_embeddings(
 # ---------------------------------------------------------------------------
 # K-means clustering
 # ---------------------------------------------------------------------------
-
 def kmeans_faiss(
     embeddings: np.ndarray,
     n_clusters: int,
@@ -250,6 +249,7 @@ def kmeans_faiss(
     )
     kmeans.train(embeddings)
     return kmeans.centroids  # (n_clusters, d_model)
+
 
 
 def kmeans_streaming(
