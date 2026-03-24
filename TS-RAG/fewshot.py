@@ -13,7 +13,7 @@ Usage:
       --model_id ETTh1_fewshot_proto512 \
       --pretrained_model_path ./checkpoints/base/ \
       --prototype_path ./checkpoints/prototypes_k512.pt \
-      --root_path ../datasets/ETT-small/ \
+      --root_path ./datasets/ETT-small/ \
       --data_path ETTh1.csv \
       --data ett_h \
       --seq_len 512 \
@@ -74,7 +74,7 @@ def get_args():
     )
 
     # Data
-    parser.add_argument("--root_path", type=str, default="../datasets/ETT-small/")
+    parser.add_argument("--root_path", type=str, default="./datasets/ETT-small/")
     parser.add_argument("--data_path", type=str, default="ETTh1.csv")
     parser.add_argument(
         "--data",

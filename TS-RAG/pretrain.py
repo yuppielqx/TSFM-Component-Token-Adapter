@@ -47,7 +47,7 @@ parser.add_argument('--context_length', type=int, default=512)
 parser.add_argument('--prediction_length', type=int, default=64)
 
 # pretrain
-parser.add_argument('--data_path', type=str, default='../datasets/pretrain/50m-with-retrieval_512', help='pretrain data path')
+parser.add_argument('--data_path', type=str, default='./datasets/pretrain/50m-with-retrieval_512', help='pretrain data path')
 parser.add_argument('--train_steps', type=int, default=200_000)
 parser.add_argument('--evaluation_steps', type=int, default=10_000)
 parser.add_argument('--optimizer', type=str, default='adamw')

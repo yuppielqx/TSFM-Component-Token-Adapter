@@ -364,3 +364,117 @@ def _init_cross_attn_weights(layer: PrototypeCrossAttentionLayer):
             nn.init.xavier_uniform_(m.weight)
             if m.bias is not None:
                 m.bias.data.zero_()
+
+
+class ChronosBoltWithLearnablePrototypes(ChronosBoltWithPrototypes):
+    """
+    ChronosBolt with a **learnable** prototype matrix.
+
+    Differences from ChronosBoltWithPrototypes:
+      - prototype_matrix is an nn.Parameter (trainable) instead of a register_buffer (frozen)
+      - Backbone (encoder, decoder, patch embeddings) is frozen in __init__
+      - Only prototype_matrix and prototype_cross_attn are trained
+
+    Intended workflow:
+      1. Instantiate via from_pretrained_for_proto_learning()
+      2. Train on retrieval_database parquet (x=context, y=forecast target)
+         using the built-in quantile loss (pass target= to forward())
+      3. Call save_prototypes(path) to export prototype_matrix as .npy
+      4. Load the saved .npy in PatchTSTWithPrototypes or ChronosBoltWithPrototypes
+         for few-shot fine-tuning
+    """
+
+    def __init__(
+        self,
+        config: T5Config,
+        n_proto: int = 512,
+        num_heads: int = 8,
+        proto_dropout: float = 0.1,
+    ):
+        # Parent creates register_buffer("prototype_matrix", zeros(512, d_model))
+        super().__init__(config, prototype_path=None, num_heads=num_heads, proto_dropout=proto_dropout)
+
+        d_model = config.d_model
+
+        # Replace the frozen buffer with a trainable Parameter.
+        # PyTorch __setattr__ automatically removes it from _buffers when
+        # a Parameter with the same name is assigned.
+        self.prototype_matrix = nn.Parameter(
+            nn.init.trunc_normal_(torch.empty(n_proto, d_model), std=0.02)
+        )
+
+        # Freeze backbone; only prototype_matrix + prototype_cross_attn remain trainable
+        self.freeze_backbone()
+
+    # ------------------------------------------------------------------
+    def save_prototypes(self, output_path: str):
+        """Save trained prototype_matrix to a .npy file."""
+        proto = self.prototype_matrix.detach().cpu().float().numpy()
+        np.save(output_path, proto)
+        print(f"Saved prototypes: shape={proto.shape}, path={output_path}")
+
+    # ------------------------------------------------------------------
+    def print_trainable_params(self):
+        total = sum(p.numel() for p in self.parameters())
+        trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        proto_numel = self.prototype_matrix.numel()
+        print(
+            f"Parameters: total={total:,}, trainable={trainable:,} "
+            f"(prototype={proto_numel:,} + cross_attn={trainable - proto_numel:,})"
+        )
+
+    # ------------------------------------------------------------------
+    @classmethod
+    def from_pretrained_for_proto_learning(
+        cls,
+        pretrained_model_path: str,
+        n_proto: int = 512,
+        num_heads: int = 8,
+        proto_dropout: float = 0.1,
+    ) -> "ChronosBoltWithLearnablePrototypes":
+        """
+        Load backbone weights from pretrained_model_path, freeze them,
+        and initialise a random learnable prototype matrix.
+
+        Supports both model.safetensors (HuggingFace) and autogluon_model.pth formats.
+
+        Example::
+            model = ChronosBoltWithLearnablePrototypes.from_pretrained_for_proto_learning(
+                pretrained_model_path='./checkpoints/base/',
+                n_proto=512,
+            )
+        """
+        from transformers import AutoConfig
+        from safetensors.torch import load_file
+
+        config = AutoConfig.from_pretrained(pretrained_model_path)
+
+        # Instantiate model first (prototype_matrix initialised as nn.Parameter)
+        model = cls(config, n_proto=n_proto, num_heads=num_heads, proto_dropout=proto_dropout)
+
+        # Load backbone weights directly to avoid HuggingFace's from_pretrained
+        # overwriting our prototype_matrix with an empty tensor
+        backbone_ckpt = os.path.join(pretrained_model_path, "autogluon_model.pth")
+        safetensors_ckpt = os.path.join(pretrained_model_path, "model.safetensors")
+
+        if os.path.exists(backbone_ckpt):
+            state = torch.load(backbone_ckpt, map_location="cpu")
+        elif os.path.exists(safetensors_ckpt):
+            state = load_file(safetensors_ckpt, device="cpu")
+        else:
+            raise FileNotFoundError(
+                f"No checkpoint found in {pretrained_model_path}. "
+                f"Expected autogluon_model.pth or model.safetensors."
+            )
+
+        missing, unexpected = model.load_state_dict(state, strict=False)
+        print(
+            f"Backbone loaded from {pretrained_model_path}  "
+            f"(missing={len(missing)}, unexpected={len(unexpected)})"
+        )
+
+        # Re-apply freeze and init cross-attention
+        model.freeze_backbone()
+        _init_cross_attn_weights(model.prototype_cross_attn)
+
+        return model

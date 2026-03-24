@@ -15,7 +15,7 @@ Usage examples:
   # Primary mode (pretrain parquet)
   python create_prototypes.py \
       --data_source pretrain \
-      --data_path ../datasets/pretrain/pretrain_pairs_ctx512 \
+      --data_path ./datasets/pretrain/pretrain_pairs_ctx512 \
       --pretrained_model_path ./checkpoints/base/ \
       --n_clusters 512 \
       --max_samples 500000 \
@@ -315,7 +315,7 @@ def get_args():
     parser.add_argument(
         "--data_path",
         type=str,
-        default="../datasets/pretrain/pretrain_pairs_ctx512",
+        default="./datasets/pretrain/pretrain_pairs_ctx512",
         help="[pretrain mode] Directory containing pretrain parquet files",
     )
     parser.add_argument(
@@ -327,7 +327,7 @@ def get_args():
     parser.add_argument(
         "--parquet_path",
         type=str,
-        default="../datasets/pretrain/retrieval_database_512.parquet",
+        default="./datasets/pretrain/retrieval_database_512.parquet",
         help="[parquet mode] Path to single retrieval_database parquet file",
     )
     parser.add_argument("--context_length", type=int, default=512)

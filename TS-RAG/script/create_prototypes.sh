@@ -21,14 +21,14 @@ output_path="./checkpoints/prototypes_k${n_clusters}.npy"
 data_source="parquet"      # pretrain | pkl | parquet
 
 # pretrain mode (needs datasets/pretrain/pretrain_pairs_ctx512/)
-data_path="../datasets/pretrain/pretrain_pairs_ctx${context_length}"
+data_path="./datasets/pretrain/pretrain_pairs_ctx${context_length}"
 
 # pkl mode (uses existing retrieval_database/*.pkl)
 pkl_dir="../retrieval_database/"
 pkl_stride=64
 
 # parquet mode (uses single retrieval_database parquet file)
-parquet_path="../datasets/pretrain/retrieval_database_512.parquet"
+parquet_path="./datasets/pretrain/retrieval_database_512.parquet"
 # ----------------------------------------
 
 if [ "$data_source" == "pretrain" ]; then

@@ -18,15 +18,15 @@ datasets="ETTh1 ETTh2"
 for dataset in $datasets; do
     if [ "$dataset" == "ETTh1" ] || [ "$dataset" == "ETTh2" ]; then
         data="ett_h"
-        root_path="../datasets/ETT-small/"
+        root_path="./datasets/ETT-small/"
         freq="h"
     elif [ "$dataset" == "ETTm1" ] || [ "$dataset" == "ETTm2" ]; then
         data="ett_m"
-        root_path="../datasets/ETT-small/"
+        root_path="./datasets/ETT-small/"
         freq="t"
     else
         data="custom"
-        root_path="../datasets/${dataset}/"
+        root_path="./datasets/${dataset}/"
         freq="h"
     fi
 

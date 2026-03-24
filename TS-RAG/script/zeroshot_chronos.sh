@@ -26,19 +26,19 @@ retrieve_database_name=$dataset
 if [ $dataset == 'ETTm1' ] || [ $dataset == 'ETTm2' ]; then
     data='ett_m_retrieve'
     metadata_frequency='minute'
-    root_path='../datasets/ETT-small/'
+    root_path='./datasets/ETT-small/'
 elif [ $dataset == 'ETTh1' ] || [ $dataset == 'ETTh2' ]; then
     data='ett_h_retrieve'
     metadata_frequency='hour'
-    root_path='../datasets/ETT-small/'
+    root_path='./datasets/ETT-small/'
 elif [ $dataset == 'electricity' ] || [ $dataset == 'exchange_rate' ]; then
     data='custom_retrieve'
     metadata_frequency='hour'
-    root_path="../datasets/${dataset}/"
+    root_path="./datasets/${dataset}/"
 elif [ $dataset == 'weather' ]; then
     data='custom_retrieve'
     metadata_frequency='10minutes'
-    root_path="../datasets/${dataset}/"
+    root_path="./datasets/${dataset}/"
 fi
 
 

@@ -9,7 +9,7 @@ context_length=512
 prediction_length=64
 
 # pretrain
-data_path=../datasets/pretrain/pretrain_pairs_ctx${retrieve_lookback_length}
+data_path=./datasets/pretrain/pretrain_pairs_ctx${retrieve_lookback_length}
 train_steps=10000
 evaluation_steps=10000
 optimizer=adamw
