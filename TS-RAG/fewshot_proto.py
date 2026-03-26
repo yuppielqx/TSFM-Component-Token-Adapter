@@ -75,8 +75,6 @@ def get_args():
     parser.add_argument("--n_layers", type=int, default=1)
     parser.add_argument("--d_ff", type=int, default=2048)
     parser.add_argument("--dropout", type=float, default=0.1)
-    parser.add_argument("--commit_beta", type=float, default=0.25,
-                        help="VQ-VAE commitment loss coefficient")
 
     # Data
     parser.add_argument("--root_path", type=str, default="./datasets/ETT-small/")
@@ -88,7 +86,7 @@ def get_args():
     parser.add_argument("--target", type=str, default="OT")
     parser.add_argument("--freq", type=str, default="h")
     parser.add_argument("--embed", type=str, default="timeF")
-    parser.add_argument("--percent", type=int, default=10,
+    parser.add_argument("--percent", type=int, default=100,
                         help="Percentage of training set to use")
     parser.add_argument("--max_len", type=int, default=-1)
 
@@ -148,7 +146,7 @@ def build_model(args, c_in: int) -> nn.Module:
 # Training / evaluation helpers
 # ---------------------------------------------------------------------------
 
-def train_one_epoch(model, loader, criterion, optimizer, device, grad_clip, pred_len, commit_beta):
+def train_one_epoch(model, loader, criterion, optimizer, device, grad_clip, pred_len):
     model.train()
     total_loss = 0.0
     n_batches = 0
@@ -161,8 +159,8 @@ def train_one_epoch(model, loader, criterion, optimizer, device, grad_clip, pred
         target = batch_y[:, -pred_len:, :]     # (B, pred_len, C)
 
         optimizer.zero_grad()
-        pred, commit_loss = model(batch_x)     # VQ-VAE forward
-        loss = criterion(pred, target) + commit_beta * commit_loss
+        pred = model(batch_x)
+        loss = criterion(pred, target)
         loss.backward()
         clip_grad_norm_(model.parameters(), grad_clip)
         optimizer.step()
@@ -183,7 +181,7 @@ def evaluate(model, loader, device, pred_len):
         batch_x = batch_x.float().to(device)
         batch_y = batch_y.float().to(device)
 
-        pred, _ = model(batch_x)               # ignore commit_loss during eval
+        pred = model(batch_x)
         true = batch_y[:, -pred_len:, :]       # (B, pred_len, C)
 
         preds.append(pred.cpu())
@@ -239,7 +237,7 @@ def main():
         t0 = time.time()
         train_loss = train_one_epoch(
             model, train_loader, criterion, optimizer, device,
-            args.grad_clip_value, args.pred_len, args.commit_beta
+            args.grad_clip_value, args.pred_len
         )
         val_mse, val_mae = evaluate(model, val_loader, device, args.pred_len)
         elapsed = time.time() - t0

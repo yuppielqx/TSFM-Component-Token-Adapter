@@ -1,8 +1,8 @@
 """
 PatchTSTWithPrototypes
 
-Channel-independent PatchTST with frozen prototype retrieval via cosine
-similarity inserted between the Transformer encoder and the linear forecast head.
+Channel-independent PatchTST with frozen prototype cross-attention inserted
+between the Transformer encoder and the linear forecast head.
 
 Architecture:
     Input (B, seq_len, C)
@@ -10,20 +10,18 @@ Architecture:
         ↓  Reshape → (B*C, seq_len)
         ↓  PatchEmbedding: unfold → linear → (B*C, n_patches, d_model)
         ↓  PatchTSTEncoder: Transformer encoder → (B*C, n_patches, d_model)
-        ↓  Prototype retrieval: cosine similarity → best prototype per patch
-           → (B*C, n_patches, d_model)  [frozen prototype embeddings]
+        ↓  PrototypeCrossAttentionLayer: cross-attn(Q=enc_out, K/V=frozen prototypes)
+           → (B*C, n_patches, d_model)
         ↓  PatchTSTDecoder: flatten → linear → (B*C, pred_len)
         ↓  Reshape → (B, pred_len, C)
 
-For each patch embedding, the most similar prototype (by cosine similarity)
-is retrieved and passed directly to the decoder instead of the encoder output.
-Prototypes are stored as a frozen register_buffer.
+Frozen:  prototype_matrix (register_buffer, not in parameters())
+Trained: RevIN, PatchEmbedding, PatchTSTEncoder, PrototypeCrossAttentionLayer, PatchTSTDecoder
 """
 
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.nn import TransformerEncoderLayer, TransformerEncoder
 
 
@@ -133,6 +131,73 @@ class PatchTSTEncoder(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# Prototype cross-attention layer
+# ---------------------------------------------------------------------------
+
+class PrototypeCrossAttentionLayer(nn.Module):
+    """
+    Cross-attention layer inserted between encoder and decoder.
+
+    Structure (Pre-norm residual):
+        x_norm  = LayerNorm(x)
+        attn_out = MultiheadAttention(Q=x_norm, K=prototypes, V=prototypes)
+        x = x + dropout(attn_out)
+        x = x + FFN(LayerNorm(x))
+
+    Args:
+        d_model:   Feature dimension
+        num_heads: Number of attention heads
+        d_ff:      FFN hidden dimension
+        dropout:   Dropout probability
+    """
+
+    def __init__(self, d_model: int, num_heads: int, d_ff: int, dropout: float = 0.1):
+        super().__init__()
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=d_model,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, d_ff),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_ff, d_model),
+            nn.Dropout(dropout),
+        )
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor, prototypes: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x:          encoder hidden states, shape (N, n_patches, d_model)
+            prototypes: prototype matrix,       shape (n_clusters, d_model)
+
+        Returns:
+            augmented: shape (N, n_patches, d_model)
+        """
+        # broadcast: (n_clusters, d_model) -> (N, n_clusters, d_model)
+        proto = prototypes.unsqueeze(0).expand(x.shape[0], -1, -1)
+
+        # Pre-norm cross-attention
+        x_norm = self.norm1(x)
+        attn_out, _ = self.cross_attn(
+            query=x_norm,
+            key=proto,
+            value=proto,
+            need_weights=False,
+        )
+        x = x + self.dropout(attn_out)
+
+        # Pre-norm FFN
+        x = x + self.ffn(self.norm2(x))
+        return x
+
+
+# ---------------------------------------------------------------------------
 # Flatten head (decoder)
 # ---------------------------------------------------------------------------
 
@@ -160,15 +225,15 @@ class PatchTSTDecoder(nn.Module):
 
 class PatchTSTWithPrototypes(nn.Module):
     """
-    Channel-independent PatchTST with frozen prototype retrieval.
+    Channel-independent PatchTST with frozen prototype cross-attention.
 
-    For each patch embedding produced by the encoder, the most similar
-    prototype (cosine similarity) is retrieved and passed to the decoder.
-    The encoder output is used only for retrieval — it is NOT passed to
-    the decoder directly.
+    After the Transformer encoder, a cross-attention layer attends over the
+    frozen prototype matrix (K/V=prototypes, Q=encoder output) to augment
+    each patch representation before the linear forecast head.
 
     Frozen:  prototype_matrix (register_buffer, not in parameters())
-    Trained: RevIN, PatchEmbedding, PatchTSTEncoder, PatchTSTDecoder
+    Trained: RevIN, PatchEmbedding, PatchTSTEncoder,
+             PrototypeCrossAttentionLayer, PatchTSTDecoder
 
     Args:
         c_in:      Number of input channels (variables)
@@ -177,7 +242,7 @@ class PatchTSTWithPrototypes(nn.Module):
         patch_len: Length of each patch token (default 16)
         stride:    Stride between patches (default 8)
         d_model:   Hidden dimension — MUST match prototype dimension (default 768)
-        n_heads:   Attention heads in encoder
+        n_heads:   Attention heads in encoder and cross-attention
         n_layers:  Number of Transformer encoder layers
         d_ff:      Feed-forward hidden dimension
         dropout:   Dropout probability
@@ -210,6 +275,7 @@ class PatchTSTWithPrototypes(nn.Module):
         self.revin = RevIN(num_features=c_in, affine=True)
         self.patch_embed = PatchEmbedding(seq_len, patch_len, stride, d_model, dropout)
         self.encoder = PatchTSTEncoder(d_model, n_heads, d_ff, n_layers, dropout)
+        self.prototype_cross_attn = PrototypeCrossAttentionLayer(d_model, n_heads, d_ff, dropout)
         self.decoder = PatchTSTDecoder(n_patches, d_model, pred_len, dropout)
 
         # Prototype matrix: frozen register_buffer (not in parameters())
@@ -236,55 +302,13 @@ class PatchTSTWithPrototypes(nn.Module):
         print(f"Loaded {proto.shape[0]} prototypes from {prototype_path}")
 
     # ------------------------------------------------------------------
-    def retrieve_prototypes(self, encoder_out: torch.Tensor):
-        """
-        VQ-VAE style prototype retrieval:
-          1. Find nearest prototype per patch via cosine similarity (argmax)
-          2. Apply straight-through estimator so gradients flow to encoder
-          3. Compute commitment loss (encoder commits to nearest prototype)
-
-        Args:
-            encoder_out: (N, n_patches, d_model)
-
-        Returns:
-            proto_st:      (N, n_patches, d_model)  straight-through output
-                           = retrieved prototype in forward,
-                           = encoder_out in backward (gradient bypass)
-            commit_loss:   scalar — beta-weighted commitment loss
-        """
-        proto = self.prototype_matrix.to(encoder_out.dtype)   # (n_clusters, d_model)
-
-        # L2-normalise for cosine similarity
-        enc_norm   = F.normalize(encoder_out, dim=-1)         # (N, n_patches, d_model)
-        proto_norm = F.normalize(proto, dim=-1)               # (n_clusters, d_model)
-
-        # Cosine similarity → (N, n_patches, n_clusters)
-        sim = torch.einsum('npd,kd->npk', enc_norm, proto_norm)
-
-        # Nearest prototype index per patch (argmax, non-differentiable)
-        best_idx = sim.argmax(dim=-1)                         # (N, n_patches)
-        retrieved = proto[best_idx]                           # (N, n_patches, d_model)
-
-        # Straight-through estimator:
-        # forward pass  : proto_st == retrieved  (discrete prototype values)
-        # backward pass : gradient flows to encoder_out (bypasses argmax)
-        proto_st = encoder_out + (retrieved - encoder_out).detach()
-
-        # Commitment loss: pull encoder output toward nearest prototype
-        # stop_gradient on prototype side (frozen anyway, but explicit for clarity)
-        commit_loss = F.mse_loss(encoder_out, retrieved.detach())
-
-        return proto_st, commit_loss
-
-    # ------------------------------------------------------------------
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Args:
             x: (B, seq_len, C)
 
         Returns:
-            out:         (B, pred_len, C)
-            commit_loss: scalar — use in training loss as beta * commit_loss
+            out: (B, pred_len, C)
         """
         B, T, C = x.shape
 
@@ -300,18 +324,18 @@ class PatchTSTWithPrototypes(nn.Module):
         # 4. Transformer encoder
         enc_out = self.encoder(x)                            # (B*C, n_patches, d_model)
 
-        # 5. VQ-VAE prototype retrieval (straight-through + commitment loss)
-        proto_st, commit_loss = self.retrieve_prototypes(enc_out)
-        # proto_st: (B*C, n_patches, d_model)
+        # 5. Prototype cross-attention (frozen K/V = prototype_matrix)
+        proto = self.prototype_matrix.to(enc_out.dtype)      # (n_clusters, d_model)
+        enc_out = self.prototype_cross_attn(enc_out, proto)  # (B*C, n_patches, d_model)
 
-        # 6. Forecast head (receives straight-through prototype)
-        out = self.decoder(proto_st)                         # (B*C, pred_len)
+        # 6. Forecast head
+        out = self.decoder(enc_out)                          # (B*C, pred_len)
 
         # 7. Reshape back and reverse normalisation
         out = out.reshape(B, C, self.pred_len).permute(0, 2, 1)  # (B, pred_len, C)
         out = self.revin(out, 'denorm')                      # (B, pred_len, C)
 
-        return out, commit_loss
+        return out
 
     # ------------------------------------------------------------------
     def print_trainable_params(self):

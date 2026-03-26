@@ -2,6 +2,7 @@ import os
 import copy
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 from typing import Optional
 from transformers.models.t5.modeling_t5 import T5Config, T5LayerNorm
@@ -407,6 +408,120 @@ class ChronosBoltWithLearnablePrototypes(ChronosBoltWithPrototypes):
         self.freeze_backbone()
 
     # ------------------------------------------------------------------
+    def forward(
+        self,
+        context: torch.Tensor,
+        mask=None,
+        target=None,
+        target_mask=None,
+    ) -> "ChronosBoltOutput":
+        """
+        Memory-efficient forward: encoder runs under torch.no_grad() since it is frozen.
+        Gradients only flow through prototype_cross_attn and the decoder's cross-attention
+        w.r.t. hidden_states (encoder params receive no gradient anyway).
+        """
+        mask = (
+            mask.to(context.dtype)
+            if mask is not None
+            else torch.isnan(context).logical_not().to(context.dtype)
+        )
+
+        batch_size, _ = context.shape
+        if context.shape[-1] > self.chronos_config.context_length:
+            context = context[..., -self.chronos_config.context_length:]
+            mask = mask[..., -self.chronos_config.context_length:]
+
+        context, loc_scale = self.instance_norm(context)
+        context = context.to(self.dtype)
+        mask = mask.to(self.dtype)
+
+        patched_context = self.patch(context)
+        patched_mask = torch.nan_to_num(self.patch(mask), nan=0.0)
+        patched_context[~(patched_mask > 0)] = 0.0
+        patched_context = torch.cat([patched_context, patched_mask], dim=-1)
+        attention_mask = patched_mask.sum(dim=-1) > 0
+
+        # --- Frozen encoder: no_grad to skip storing intermediate activations ---
+        with torch.no_grad():
+            input_embeds = self.input_patch_embedding(patched_context)
+
+            if self.chronos_config.use_reg_token:
+                reg_input_ids = torch.full(
+                    (batch_size, 1), self.config.reg_token_id, device=input_embeds.device
+                )
+                reg_embeds = self.shared(reg_input_ids)
+                input_embeds = torch.cat([input_embeds, reg_embeds], dim=-2)
+                attention_mask = torch.cat(
+                    [attention_mask, torch.ones_like(reg_input_ids, dtype=attention_mask.dtype)],
+                    dim=-1,
+                )
+
+            encoder_outputs = self.encoder(
+                attention_mask=attention_mask,
+                inputs_embeds=input_embeds,
+            )
+            hidden_states = encoder_outputs[0]  # (B, n_patches, d_model)
+
+        # Detach: encoder is frozen, no gradient should flow back into it
+        hidden_states = hidden_states.detach()
+
+        # --- Prototype cross-attention (trainable) ---
+        proto = self.prototype_matrix.to(hidden_states.dtype)
+        hidden_states = self.prototype_cross_attn(hidden_states, proto)
+
+        sequence_output = self.decode(input_embeds, attention_mask, hidden_states)
+
+        quantile_preds_shape = (
+            batch_size,
+            self.num_quantiles,
+            self.chronos_config.prediction_length,
+        )
+        quantile_preds = self.output_patch_embedding(sequence_output).view(*quantile_preds_shape)
+
+        loss = None
+        if target is not None:
+            target, _ = self.instance_norm(target, loc_scale)
+            target = target.unsqueeze(1)
+            assert self.chronos_config.prediction_length >= target.shape[-1]
+
+            target = target.to(quantile_preds.device)
+            target_mask = (
+                target_mask.unsqueeze(1).to(quantile_preds.device)
+                if target_mask is not None
+                else ~torch.isnan(target)
+            )
+            target[~target_mask] = 0.0
+
+            if self.chronos_config.prediction_length > target.shape[-1]:
+                padding_shape = (
+                    *target.shape[:-1],
+                    self.chronos_config.prediction_length - target.shape[-1],
+                )
+                target = torch.cat([target, torch.zeros(padding_shape).to(target)], dim=-1)
+                target_mask = torch.cat(
+                    [target_mask, torch.zeros(padding_shape).to(target_mask)], dim=-1
+                )
+
+            loss = (
+                2
+                * torch.abs(
+                    (target - quantile_preds)
+                    * (
+                        (target <= quantile_preds).float()
+                        - self.quantiles.view(1, self.num_quantiles, 1)
+                    )
+                )
+                * target_mask.float()
+            )
+            loss = loss.mean(dim=-2).sum(dim=-1).mean()
+
+        quantile_preds = self.instance_norm.inverse(
+            quantile_preds.view(batch_size, -1), loc_scale
+        ).view(*quantile_preds_shape)
+
+        return ChronosBoltOutput(loss=loss, quantile_preds=quantile_preds)
+
+    # ------------------------------------------------------------------
     def save_prototypes(self, output_path: str):
         """Save trained prototype_matrix to a .npy file."""
         proto = self.prototype_matrix.detach().cpu().float().numpy()
@@ -477,4 +592,288 @@ class ChronosBoltWithLearnablePrototypes(ChronosBoltWithPrototypes):
         model.freeze_backbone()
         _init_cross_attn_weights(model.prototype_cross_attn)
 
+        return model
+
+
+# ---------------------------------------------------------------------------
+# RQ-VAE based prototype learning
+# ---------------------------------------------------------------------------
+
+class ResidualQuantizer(nn.Module):
+    """
+    Residual Quantization (RQ) with straight-through estimator (STE).
+
+    Applies `n_stages` rounds of vector quantization on the residual:
+        z_q_1 = codebook_1[argmin ||z - e||]
+        r_1   = z - z_q_1
+        z_q_2 = codebook_2[argmin ||r_1 - e||]
+        ...
+        quantized = z_q_1 + z_q_2 + ... + z_q_K
+
+    STE: gradient passes straight through the quantized output back to z.
+
+    Args:
+        n_stages: Number of RQ stages (codebook depth).
+        n_proto:  Number of entries per codebook.
+        d_model:  Embedding dimension.
+        beta:     Weight of commitment loss (encoder → codebook).
+    """
+
+    def __init__(
+        self,
+        n_stages: int = 4,
+        n_proto: int = 256,
+        d_model: int = 768,
+        beta: float = 0.25,
+    ):
+        super().__init__()
+        self.n_stages = n_stages
+        self.beta = beta
+        self.codebooks = nn.ModuleList([
+            nn.Embedding(n_proto, d_model) for _ in range(n_stages)
+        ])
+        for cb in self.codebooks:
+            nn.init.trunc_normal_(cb.weight, std=0.02)
+
+    def forward(self, z: torch.Tensor):
+        """
+        Args:
+            z: encoder hidden states (B, n_patches, d_model)
+
+        Returns:
+            quantized_ste: quantized representation via STE, same shape as z
+            commit_loss:   scalar sum of codebook + commitment losses
+        """
+        B, n_patches, d_model = z.shape
+        residual = z
+        quantized_sum = torch.zeros_like(z)
+        commit_loss = z.new_tensor(0.0)
+
+        for codebook in self.codebooks:
+            cb_weight = codebook.weight  # (n_proto, d_model)
+
+            # L2 distance: ||residual - e||² = ||residual||² + ||e||² - 2*<residual, e>
+            # Use detached residual for argmin (non-differentiable anyway)
+            r_det = residual.detach()
+            dist = (
+                r_det.pow(2).sum(-1, keepdim=True)                                  # (B, n_patches, 1)
+                + cb_weight.pow(2).sum(-1)                                           # (n_proto,)
+                - 2.0 * torch.einsum("bpd,nd->bpn", r_det, cb_weight)               # (B, n_patches, n_proto)
+            )
+            indices = dist.argmin(dim=-1)           # (B, n_patches)
+            z_q = codebook(indices)                 # (B, n_patches, d_model)
+
+            # Codebook loss: move codebook entries towards encoder output
+            commit_loss = commit_loss + F.mse_loss(r_det, z_q)
+            # Commitment loss: move encoder output towards codebook entries
+            commit_loss = commit_loss + self.beta * F.mse_loss(residual, z_q.detach())
+
+            quantized_sum = quantized_sum + z_q
+            residual = residual - z_q.detach()
+
+        # Straight-through estimator:
+        # forward = quantized_sum, backward = gradient of z (passes through)
+        quantized_ste = z + (quantized_sum - z).detach()
+        return quantized_ste, commit_loss
+
+
+class ChronosBoltWithRQVAEPrototypes(ChronosBoltModelForForecasting):
+    """
+    ChronosBolt with RQ-VAE prototype learning via masked recovery.
+
+    Training objective
+    ------------------
+    1. Randomly mask ``mask_ratio`` fraction of input time-points (point-level).
+    2. Pass masked context through the frozen T5 encoder.
+    3. Quantise each patch representation via ResidualQuantizer (4 codebooks).
+    4. Decode each patch with a lightweight linear head → reconstruct 512 points.
+    5. Loss = MSE(reconstructed, normalised_original) + codebook/commitment losses.
+
+    Trainable parameters
+    --------------------
+    - ResidualQuantizer codebooks  (n_stages × n_proto × d_model)
+    - reconstruction_head          (d_model → patch_size)
+
+    Args:
+        config:       T5Config (from pretrained checkpoint).
+        n_proto:      Codebook size per stage.
+        n_rq_stages:  Number of RQ stages.
+        beta:         Commitment loss weight.
+        mask_ratio:   Fraction of time-points to mask (0.1 → 10%).
+    """
+
+    def __init__(
+        self,
+        config: T5Config,
+        n_proto: int = 256,
+        n_rq_stages: int = 4,
+        beta: float = 0.25,
+        mask_ratio: float = 0.1,
+    ):
+        super().__init__(config)
+
+        d_model = config.d_model
+        patch_size = config.chronos_config.input_patch_size  # 16 for ChronosBolt-base
+
+        self.mask_ratio = mask_ratio
+        self.residual_quantizer = ResidualQuantizer(
+            n_stages=n_rq_stages, n_proto=n_proto, d_model=d_model, beta=beta
+        )
+        self.reconstruction_head = nn.Linear(d_model, patch_size)
+
+        # Freeze T5 backbone
+        self.freeze_backbone()
+
+    def freeze_backbone(self):
+        for mod in [
+            self.encoder,
+            self.decoder,
+            self.shared,
+            self.input_patch_embedding,
+            self.output_patch_embedding,
+        ]:
+            for p in mod.parameters():
+                p.requires_grad = False
+
+    def print_trainable_params(self):
+        total = sum(p.numel() for p in self.parameters())
+        trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        print(f"Parameters: total={total:,}, trainable={trainable:,}")
+
+    def forward(
+        self,
+        context: torch.Tensor,
+        mask_ratio: Optional[float] = None,
+    ) -> ChronosBoltOutput:
+        """
+        Args:
+            context:    Input time series (B, seq_len). Values may be any scale.
+            mask_ratio: Override instance mask_ratio if provided.
+
+        Returns:
+            ChronosBoltOutput with .loss (reconstruction + commit losses).
+        """
+        if mask_ratio is None:
+            mask_ratio = self.mask_ratio
+
+        batch_size = context.shape[0]
+
+        # Truncate to model context_length if needed
+        if context.shape[-1] > self.chronos_config.context_length:
+            context = context[..., -self.chronos_config.context_length :]
+
+        # Instance normalisation (frozen statistics computation)
+        context_norm, loc_scale = self.instance_norm(context)
+        context_norm = context_norm.to(self.dtype)
+
+        # Target: normalised original (for loss computation)
+        target = context_norm.detach().clone()
+
+        # Point-level random masking: replace mask_ratio fraction with 0.0
+        seq_len = context_norm.shape[-1]
+        recovery_mask = torch.rand(batch_size, seq_len, device=context.device) < mask_ratio
+        context_masked = context_norm.clone()
+        context_masked[recovery_mask] = 0.0  # 0.0 ≈ mean in normalised space
+
+        # All positions are valid (no NaN in parquet data)
+        attn_mask_1d = torch.ones(batch_size, seq_len, device=context.device, dtype=self.dtype)
+
+        # Patching: (B, seq_len) → (B, n_patches, patch_size)
+        patched_context = self.patch(context_masked)
+        patched_mask = torch.nan_to_num(self.patch(attn_mask_1d), nan=0.0)
+        patched_context[~(patched_mask > 0)] = 0.0
+        patched_context = torch.cat([patched_context, patched_mask], dim=-1)
+        attention_mask = patched_mask.sum(dim=-1) > 0  # (B, n_patches)
+
+        # Frozen encoder (no_grad for memory efficiency)
+        with torch.no_grad():
+            input_embeds = self.input_patch_embedding(patched_context)
+            # REG token is NOT added (recovery task does not require global token)
+            encoder_outputs = self.encoder(
+                attention_mask=attention_mask,
+                inputs_embeds=input_embeds,
+            )
+            hidden_states = encoder_outputs[0]  # (B, n_patches, d_model)
+
+        # Detach from encoder graph; only quantiser + head receive gradients
+        hidden_states = hidden_states.detach()
+
+        # Residual quantisation
+        quantized, commit_loss = self.residual_quantizer(hidden_states)
+
+        # Per-patch reconstruction: (B, n_patches, d_model) → (B, n_patches, patch_size)
+        pred_patches = self.reconstruction_head(quantized)
+
+        # Flatten to time series: (B, n_patches * patch_size)
+        pred_x = pred_patches.reshape(batch_size, -1)
+
+        # Align length with target (in case of padding)
+        target_len = target.shape[-1]
+        pred_x = pred_x[..., :target_len]
+
+        # Reconstruction loss on ALL time points (normalised space)
+        recon_loss = F.mse_loss(pred_x, target)
+        total_loss = recon_loss + commit_loss
+
+        return ChronosBoltOutput(loss=total_loss)
+
+    def save_codebooks(self, output_path: str):
+        """Save all RQ codebook weights to a .pt file."""
+        state = {
+            f"codebook_{i}": cb.weight.detach().cpu().float()
+            for i, cb in enumerate(self.residual_quantizer.codebooks)
+        }
+        torch.save(state, output_path)
+        print(f"Saved {len(state)} codebooks to {output_path}")
+
+    @classmethod
+    def from_pretrained_for_rqvae(
+        cls,
+        pretrained_model_path: str,
+        n_proto: int = 256,
+        n_rq_stages: int = 4,
+        beta: float = 0.25,
+        mask_ratio: float = 0.1,
+    ) -> "ChronosBoltWithRQVAEPrototypes":
+        """
+        Load backbone weights, freeze them, and initialise RQ-VAE modules.
+
+        Example::
+            model = ChronosBoltWithRQVAEPrototypes.from_pretrained_for_rqvae(
+                pretrained_model_path='./checkpoints/base/',
+                n_proto=256,
+            )
+        """
+        from transformers import AutoConfig
+        from safetensors.torch import load_file
+
+        config = AutoConfig.from_pretrained(pretrained_model_path)
+        model = cls(
+            config,
+            n_proto=n_proto,
+            n_rq_stages=n_rq_stages,
+            beta=beta,
+            mask_ratio=mask_ratio,
+        )
+
+        backbone_ckpt = os.path.join(pretrained_model_path, "autogluon_model.pth")
+        safetensors_ckpt = os.path.join(pretrained_model_path, "model.safetensors")
+
+        if os.path.exists(backbone_ckpt):
+            state = torch.load(backbone_ckpt, map_location="cpu")
+        elif os.path.exists(safetensors_ckpt):
+            state = load_file(safetensors_ckpt, device="cpu")
+        else:
+            raise FileNotFoundError(
+                f"No checkpoint found in {pretrained_model_path}. "
+                f"Expected autogluon_model.pth or model.safetensors."
+            )
+
+        missing, unexpected = model.load_state_dict(state, strict=False)
+        print(
+            f"Backbone loaded from {pretrained_model_path}  "
+            f"(missing={len(missing)}, unexpected={len(unexpected)})"
+        )
+
+        model.freeze_backbone()
         return model
