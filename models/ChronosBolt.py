@@ -38,6 +38,7 @@ class ChronosBoltOutput(ModelOutput):
     quantile_preds: Optional[torch.Tensor] = None
     attentions: Optional[torch.Tensor] = None
     cross_attentions: Optional[torch.Tensor] = None
+    reconstruction: Optional[torch.Tensor] = None
 
 
 class Patch(nn.Module):

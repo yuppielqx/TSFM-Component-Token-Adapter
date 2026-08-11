@@ -1,5 +1,17 @@
-autogluon==1.3.0
-chronos-forecasting==1.5.1
-faiss_gpu==1.7.2
-numpy==1.25.0
-wandb==0.19.10
+# Core runtime for the Component-Token Adapter pipeline.
+# Install the CUDA-matched PyTorch build separately when needed.
+torch>=2.6,<2.7
+transformers>=4.49,<4.50
+safetensors>=0.7,<0.8
+
+# Data loading and preprocessing
+numpy>=2.0,<2.1
+pandas>=2.2,<2.3
+pyarrow>=21,<22
+scikit-learn>=1.6,<1.7
+statsmodels>=0.14,<0.15
+matplotlib>=3.9,<4
+tqdm>=4.67,<5
+
+# Used by the T5/Chronos model implementation and parquet/data utilities.
+sentencepiece>=0.2,<0.3
