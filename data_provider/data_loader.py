@@ -38,6 +38,14 @@ def get_custom_period_channel(data_path):
         # 1week
         pc["period"] = 24
         pc["channel"] = 8
+    if any(name in data_path for name in ("ETTh1", "ETTh2")):
+        # hourly ETT-small datasets
+        pc["period"] = 24
+        pc["channel"] = 7
+    if any(name in data_path for name in ("ETTm1", "ETTm2")):
+        # 15-minute ETT-small datasets
+        pc["period"] = 96
+        pc["channel"] = 7
     return pc
 
 def decompose( 
