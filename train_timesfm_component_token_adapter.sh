@@ -16,7 +16,7 @@ PERIOD=${PERIOD:-24}
   --seq_len 512 --pred_len 64 --label_len 48 \
   --pretrained_model_path ./checkpoints/timesfm-2.5-200m-pytorch \
   --component_codebook_dir ./checkpoints/timesfm_component_rqvae \
-  --components "trend seasonal residual" \
+  --components "trend seasonal" \
   --period "${PERIOD}" --trend_kernel 25 \
   --train_epochs 20 --batch_size 64 --num_workers 4 \
   --learning_rate 1e-4 --weight_decay 0.01 --patience 3 \

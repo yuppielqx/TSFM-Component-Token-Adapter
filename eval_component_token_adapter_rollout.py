@@ -14,7 +14,7 @@ from tqdm import tqdm
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from data_provider.data_factory import data_provider
-from models.ComponentTemporalTokenAdapter import ComponentTemporalTokenAdapter
+from models.chronos_bolt.ComponentTemporalTokenAdapter import ComponentTemporalTokenAdapter
 
 warnings.filterwarnings("ignore")
 

@@ -37,7 +37,7 @@ def get_args():
     parser.add_argument("--pretrained_model_path", default="./checkpoints/timesfm-2.5-200m-pytorch")
     parser.add_argument("--component_codebook_dir", default="./checkpoints/timesfm_component_rqvae")
     parser.add_argument("--adapter_checkpoint", required=True)
-    parser.add_argument("--components", default="trend seasonal residual")
+    parser.add_argument("--components", default="trend seasonal")
     parser.add_argument("--n_proto", type=int, default=256)
     parser.add_argument("--n_rq_stages", type=int, default=2)
     parser.add_argument("--period", type=int, default=24)

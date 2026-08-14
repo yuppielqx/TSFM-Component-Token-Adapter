@@ -28,7 +28,7 @@ class TimesFMComponentTokenAdapter(nn.Module):
     def __init__(
         self,
         component_codebook_paths: Dict[str, str],
-        components: Sequence[str] = ("trend", "seasonal", "residual"),
+        components: Sequence[str] = ("trend", "seasonal"),
         n_proto: int = 256,
         n_rq_stages: int = 2,
         period: int = 24,
