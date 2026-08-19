@@ -9,12 +9,11 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
-_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _ROOT)
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from data_provider.data_factory import data_provider
-from Moirai2ComponentTokenAdapter import Moirai2ComponentTokenAdapter
+from models.moirai2.Moirai2ComponentTokenAdapter import Moirai2ComponentTokenAdapter
 
 
 def get_args():

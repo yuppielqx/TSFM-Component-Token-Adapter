@@ -10,7 +10,7 @@ GPU_ID="${GPU_ID:-0}"
 DATASET="${DATASET:-ETTh1}"
 PERIOD="${PERIOD:-24}"
 
-CUDA_VISIBLE_DEVICES="${GPU_ID}" "${PYTHON_BIN}" moirai2_adapter_impl/train_moirai2_component_token_adapter.py \
+CUDA_VISIBLE_DEVICES="${GPU_ID}" "${PYTHON_BIN}" train_moirai2_component_token_adapter.py \
   --model_id "${DATASET}_moirai2_component_adapter" --data ett_h \
   --root_path ./datasets/ETT-small/ --data_path "${DATASET}.csv" --features M --freq h --percent 100 \
   --seq_len 512 --pred_len 64 --label_len 48 --components "trend seasonal" --period "${PERIOD}" \
