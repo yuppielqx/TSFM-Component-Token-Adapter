@@ -20,7 +20,7 @@ case "${DATASET}" in
     FREQ=t; PERIOD=96; FREQUENCY_TOKEN=5 ;;
   Traffic)
     ROOT=./datasets/traffic/; FILE=traffic.csv
-    FREQ=t; PERIOD=96; FREQUENCY_TOKEN=5 ;;
+    FREQ=h; PERIOD=24; FREQUENCY_TOKEN=7 ;;
   *) echo "Unsupported dataset: ${DATASET}" >&2; exit 2 ;;
 esac
 
