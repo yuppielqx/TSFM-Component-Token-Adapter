@@ -1,6 +1,7 @@
-"""Evaluate a Moirai-2 Component-Token Adapter at multiple direct horizons."""
+"""Recursive rollout evaluation for a Moirai-2 Component-Token Adapter."""
 
 import argparse
+import math
 import os
 import random
 import sys
@@ -33,9 +34,13 @@ def get_args():
     parser.add_argument("--pred_len", type=int, default=720)
     parser.add_argument("--label_len", type=int, default=48)
     parser.add_argument("--horizons", default="96 192 336 720")
+    parser.add_argument("--rollout_chunk", type=int, default=64)
+    parser.add_argument("--rollout_mode", choices=("official", "point"), default="official")
     parser.add_argument("--moirai_model_id", default="Salesforce/moirai-2.0-R-small")
     parser.add_argument("--component_codebook_dir", default="./checkpoints/moirai2_component_rqvae")
     parser.add_argument("--adapter_checkpoint", required=True)
+    parser.add_argument("--disable_adapter", action="store_true", default=False,
+                        help="Evaluate the frozen Moirai2 backbone without adapter injection.")
     parser.add_argument("--components", default="trend seasonal")
     parser.add_argument("--n_proto", type=int, default=256)
     parser.add_argument("--n_rq_stages", type=int, default=2)
@@ -72,6 +77,27 @@ def build_model(args, device):
     return model.eval()
 
 
+@torch.no_grad()
+def point_rolling_forecast(model, context, horizon, chunk_length):
+    """Forecast ``horizon`` steps by recursively feeding 64-step predictions."""
+    rolling_context, chunks = context, []
+    for _ in range(math.ceil(horizon / chunk_length)):
+        output = model(rolling_context, prediction_length=chunk_length)
+        prediction = model.central_prediction(output)
+        chunks.append(prediction)
+        rolling_context = torch.cat([rolling_context, prediction], dim=-1)[..., -context.shape[-1]:]
+    return torch.cat(chunks, dim=-1)[..., :horizon]
+
+
+@torch.no_grad()
+def official_quantile_forecast(model, context, horizon, chunk_length):
+    """Delegate the complete long forecast to the official Moirai2 wrapper."""
+    max_chunk = model.backbone.num_predict_token * model.backbone.patch_size
+    if chunk_length != max_chunk:
+        raise ValueError(f"official rollout_chunk must equal {max_chunk}, got {chunk_length}")
+    return model(context, prediction_length=horizon)["quantile_predictions"].float()
+
+
 def main():
     args = get_args()
     random.seed(args.seed); np.random.seed(args.seed); torch.manual_seed(args.seed)
@@ -81,14 +107,27 @@ def main():
     device = torch.device(f"cuda:{args.gpu_loc}" if torch.cuda.is_available() else "cpu")
     _, test_loader = data_provider(args, "test")
     model = build_model(args, device)
+    if args.disable_adapter:
+        # Bypass all hooks so this path is exactly the official Moirai2Forecast.
+        model.set_adapter_enabled(False)
     sums = {horizon: {"se": 0.0, "ae": 0.0, "n": 0} for horizon in horizons}
     with torch.no_grad():
-        for index, batch in enumerate(tqdm(test_loader, desc="Moirai-2 direct evaluation")):
+        for index, batch in enumerate(tqdm(test_loader, desc="Moirai-2 rollout evaluation")):
             if args.max_test_batches > 0 and index >= args.max_test_batches:
                 break
             context = batch[0].float().to(device).squeeze(-1)
             target = batch[1].float().to(device).squeeze(-1)[:, -args.pred_len:]
-            prediction = model.central_prediction(model(context, prediction_length=max(horizons)))
+            if args.rollout_mode == "official":
+                quantile_prediction = official_quantile_forecast(
+                    model, context, max(horizons), args.rollout_chunk
+                )
+                central_index = min(
+                    range(len(model.quantile_levels)),
+                    key=lambda value: abs(model.quantile_levels[value] - 0.5),
+                )
+                prediction = quantile_prediction[:, central_index]
+            else:
+                prediction = point_rolling_forecast(model, context, max(horizons), args.rollout_chunk)
             for horizon in horizons:
                 truth, estimate = target[:, :horizon], prediction[:, :horizon]
                 valid, difference = torch.isfinite(truth), estimate - torch.nan_to_num(truth, nan=0.0)
@@ -97,9 +136,9 @@ def main():
                 sums[horizon]["n"] += valid.sum().item()
     os.makedirs(args.results_dir, exist_ok=True)
     stem = os.path.splitext(os.path.basename(args.data_path))[0]
-    path = os.path.join(args.results_dir, f"{stem}_moirai2_component_adapter_direct.txt")
+    path = os.path.join(args.results_dir, f"{stem}_moirai2_component_adapter_{args.rollout_mode}_rollout.txt")
     with open(path, "w") as handle:
-        handle.write(f"data_path={args.data_path}\nmode=direct\nseq_len={args.seq_len}\n")
+        handle.write(f"data_path={args.data_path}\nmode={args.rollout_mode}_rollout\nseq_len={args.seq_len}\nrollout_chunk={args.rollout_chunk}\n")
         for horizon in horizons:
             mse, mae = sums[horizon]["se"] / sums[horizon]["n"], sums[horizon]["ae"] / sums[horizon]["n"]
             handle.write(f"horizon={horizon} MSE={mse:.6f} MAE={mae:.6f}\n")

@@ -1,8 +1,10 @@
 """Discrete trend/seasonal token adapter for a frozen Moirai-2 backbone."""
 
 import math
+import json
 import os
 import sys
+import warnings
 from typing import Dict, Sequence
 
 import torch
@@ -13,6 +15,7 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__
 sys.path.insert(0, os.path.join(_ROOT, "models", "moirai2"))
 
 from uni2ts.common.torch_util import packed_causal_attention_mask
+from uni2ts.model.moirai2.forecast import Moirai2Forecast
 from uni2ts.model.moirai2.module import Moirai2Module
 from utils.decomposition import select_component
 
@@ -54,7 +57,20 @@ class Moirai2ComponentTokenAdapter(nn.Module):
         self.codebooks = nn.ModuleDict()
         self.code_embedding_tables = nn.ModuleDict()
         for component in self.components:
-            checkpoint = torch.load(component_codebook_paths[component], map_location="cpu")
+            codebook_path = component_codebook_paths[component]
+            metadata_path = codebook_path[:-3] + ".meta.json" if codebook_path.endswith(".pt") else codebook_path + ".meta.json"
+            if os.path.isfile(metadata_path):
+                with open(metadata_path) as handle:
+                    metadata = json.load(handle)
+                trained_period = metadata.get("period")
+                if trained_period is not None and int(trained_period) != self.period:
+                    warnings.warn(
+                        f"Using shared pretrained {component} codebook across periods: "
+                        f"adapter period={self.period}, codebook training period={trained_period} "
+                        f"({metadata_path})",
+                        RuntimeWarning,
+                    )
+            checkpoint = torch.load(codebook_path, map_location="cpu")
             if checkpoint.get("backbone") not in (None, "moirai-2.0-R-small"):
                 raise ValueError(f"Not a Moirai-2 codebook: {component_codebook_paths[component]}")
             if checkpoint.get("d_model", self.d_model) != self.d_model:
@@ -70,7 +86,12 @@ class Moirai2ComponentTokenAdapter(nn.Module):
                 embedding.weight.data.copy_(weight)
                 embedding.weight.requires_grad_(False)
                 stages.append(embedding)
-                tables.append(nn.Embedding(n_proto, self.d_model))
+                # Preserve the RQ-VAE prototype geometry at initialization.
+                # The previous implementation used a random lookup table, so
+                # a discrete code no longer represented its learned prototype.
+                token_embedding = nn.Embedding(n_proto, self.d_model)
+                token_embedding.weight.data.copy_(weight)
+                tables.append(token_embedding)
             self.codebooks[component] = nn.ModuleList(stages)
             self.code_embedding_tables[component] = nn.ModuleList(tables)
 
@@ -87,9 +108,16 @@ class Moirai2ComponentTokenAdapter(nn.Module):
             self.d_model, cross_attention_heads, dropout=token_dropout, batch_first=True
         )
         self.token_projection = nn.Linear(self.d_model, self.d_model)
+        # Start as an exact identity adapter. This keeps the frozen backbone's
+        # forecast unchanged before downstream optimization learns an update.
+        nn.init.zeros_(self.token_projection.weight)
+        nn.init.zeros_(self.token_projection.bias)
         self.fusion_gate = nn.Linear(2 * self.d_model, self.d_model)
         nn.init.zeros_(self.fusion_gate.weight)
         nn.init.constant_(self.fusion_gate.bias, gate_bias_init)
+        self.adapter_enabled = True
+        self._skip_encoder_injection = False
+        self._pending_injection = None
         self.freeze_backbone()
 
     @classmethod
@@ -114,9 +142,15 @@ class Moirai2ComponentTokenAdapter(nn.Module):
         trainable = sum(parameter.numel() for parameter in self.parameters() if parameter.requires_grad)
         print(f"Parameters: total={total:,}, trainable={trainable:,}")
 
+    def set_adapter_enabled(self, enabled: bool):
+        """Enable or bypass adapter injection without changing any weights."""
+        self.adapter_enabled = bool(enabled)
+
     def _prepare_context(self, context):
-        if context.ndim != 2 or context.shape[-1] != self.context_length:
-            raise ValueError(f"context must be (batch, {self.context_length}), got {tuple(context.shape)}")
+        if context.ndim != 2 or context.shape[-1] < self.context_length:
+            raise ValueError(f"context must be (batch, length >= {self.context_length}), got {tuple(context.shape)}")
+        if context.shape[-1] % self.patch_size:
+            raise ValueError("context length must be divisible by Moirai-2 patch_size")
         return torch.nan_to_num(context.float(), nan=0.0), torch.isfinite(context)
 
     def _metadata(self, batch_size, tokens, device):
@@ -141,6 +175,11 @@ class Moirai2ComponentTokenAdapter(nn.Module):
 
     @torch.no_grad()
     def _component_codes(self, raw_context, component):
+        # Codebooks were trained on fixed 512-step windows. During official
+        # autoregressive inference, the backbone context grows as future
+        # patches are assigned, while component conditioning uses the latest
+        # fixed-length window.
+        raw_context = raw_context[..., -self.context_length:]
         hidden = self._encode_component_hidden(select_component(
             raw_context, component, period=self.period, trend_kernel=self.trend_kernel
         ))
@@ -167,42 +206,98 @@ class Moirai2ComponentTokenAdapter(nn.Module):
                 tokens.append(self.code_embedding_tables[component][stage](indices) + component_embed + stage_embed + position)
         return self.patch_token_aggregator(self.token_dropout(torch.cat(tokens, dim=-1)))
 
-    def _base_hidden(self, context, prediction_length):
-        values, observed = self._prepare_context(context)
-        batch_size = values.shape[0]
-        future_patches = math.ceil(prediction_length / self.patch_size)
-        padded_future = future_patches * self.patch_size
-        tokens = self.context_length // self.patch_size + future_patches
-        future = torch.zeros((batch_size, padded_future), device=values.device, dtype=values.dtype)
-        target = torch.cat([values, future], dim=1).unsqueeze(-1).reshape(batch_size, tokens, self.patch_size)
-        mask = torch.cat([observed, torch.zeros_like(future, dtype=torch.bool)], dim=1).unsqueeze(-1).reshape_as(target)
-        sample_id, time_id, var_id = self._metadata(batch_size, tokens, values.device)
-        prediction_mask = torch.zeros((batch_size, tokens), dtype=torch.bool, device=values.device)
-        prediction_mask[:, -future_patches:] = True
-        with torch.no_grad():
-            loc, scale = self.backbone.scaler(target, mask, sample_id, var_id)
-            inputs = self.backbone.in_proj(torch.cat([(target - loc) / scale, mask.float()], dim=-1))
-            hidden = self.backbone.encoder(
-                inputs, packed_causal_attention_mask(sample_id, time_id), time_id=time_id, var_id=var_id
-            ).detach()
-        return hidden[:, -future_patches:], loc, scale, future_patches
+    def _prepare_official_injection(self, module, args):
+        """Prepare component conditioning from an official module invocation.
+
+        ``Moirai2Forecast`` owns future-token construction and recursive
+        assignment.  This pre-hook only identifies the latest known source
+        token and reconstructs its most recent fixed-length raw context.
+        """
+        target, prediction_mask = args[0], args[5]
+        if target.shape[-1] != self.patch_size:
+            raise RuntimeError(f"Unexpected official target shape: {tuple(target.shape)}")
+        token_length = target.shape[-2]
+        flat_target = target.reshape(-1, token_length, self.patch_size)
+        flat_prediction_mask = prediction_mask.reshape(-1, token_length)
+        known_tokens = (~flat_prediction_mask).sum(dim=-1)
+        context_tokens = self.context_length // self.patch_size
+        if torch.any(known_tokens < context_tokens):
+            raise RuntimeError("Official Moirai2 call has fewer known tokens than adapter context")
+
+        flat_values = flat_target.reshape(flat_target.shape[0], -1)
+        context_end = known_tokens * self.patch_size
+        offsets = torch.arange(self.context_length, device=target.device).unsqueeze(0)
+        gather_index = context_end.unsqueeze(1) - self.context_length + offsets
+        raw_context = flat_values.gather(1, gather_index)
+
+        self._pending_injection = None
+        self._skip_encoder_injection = True
+        try:
+            condition = self._component_condition(raw_context)
+        finally:
+            self._skip_encoder_injection = False
+        self._pending_injection = (condition, known_tokens - 1)
+
+    def _inject_official_hidden(self, module, args, hidden):
+        """Inject into exactly the source states decoded by official Moirai2."""
+        if self._skip_encoder_injection or self._pending_injection is None:
+            return hidden
+        condition, source_index = self._pending_injection
+        self._pending_injection = None
+        token_length = hidden.shape[-2]
+        flat_hidden = hidden.reshape(-1, token_length, self.d_model)
+        if flat_hidden.shape[0] != condition.shape[0]:
+            raise RuntimeError(
+                f"Adapter batch mismatch: hidden={flat_hidden.shape[0]} condition={condition.shape[0]}"
+            )
+        rows = torch.arange(flat_hidden.shape[0], device=hidden.device)
+        source_hidden = flat_hidden[rows, source_index].unsqueeze(1)
+        attended, _ = self.future_to_component_attention(
+            source_hidden, condition, condition, need_weights=False
+        )
+        gate = torch.sigmoid(self.fusion_gate(torch.cat([source_hidden, attended], dim=-1)))
+        fused = source_hidden + gate * self.token_projection(attended)
+        updated = flat_hidden.clone()
+        updated[rows, source_index] = fused.squeeze(1)
+        return updated.reshape_as(hidden)
+
+    def _official_predictions(self, context, prediction_length):
+        if context.ndim != 2 or context.shape[-1] != self.context_length:
+            raise ValueError(
+                f"official context must be (batch, {self.context_length}), got {tuple(context.shape)}"
+            )
+        observed = torch.isfinite(context)
+        clean_context = torch.nan_to_num(context.float(), nan=0.0)
+        forecast = Moirai2Forecast(
+            module=self.backbone,
+            prediction_length=prediction_length,
+            context_length=self.context_length,
+            target_dim=1,
+            feat_dynamic_real_dim=0,
+            past_feat_dynamic_real_dim=0,
+        ).to(context.device)
+        pre_handle = encoder_handle = None
+        try:
+            if self.adapter_enabled:
+                pre_handle = self.backbone.register_forward_pre_hook(self._prepare_official_injection)
+                encoder_handle = self.backbone.encoder.register_forward_hook(self._inject_official_hidden)
+            return forecast(
+                past_target=clean_context.unsqueeze(-1),
+                past_observed_target=observed.unsqueeze(-1),
+                past_is_pad=torch.zeros_like(clean_context, dtype=torch.bool),
+            )
+        finally:
+            self._pending_injection = None
+            self._skip_encoder_injection = False
+            if encoder_handle is not None:
+                encoder_handle.remove()
+            if pre_handle is not None:
+                pre_handle.remove()
 
     def forward(self, context, target=None, prediction_length=64):
         if prediction_length <= 0:
             raise ValueError("prediction_length must be positive")
-        future_hidden, loc, scale, future_patches = self._base_hidden(context, prediction_length)
-        condition = self._component_condition(context)
-        attended, _ = self.future_to_component_attention(future_hidden, condition, condition, need_weights=False)
-        gate = torch.sigmoid(self.fusion_gate(torch.cat([future_hidden, attended], dim=-1)))
-        fused = future_hidden + gate * self.token_projection(attended)
-        raw = self.backbone.out_proj(fused)
-        expected = self.backbone.num_predict_token * self.backbone.num_quantiles * self.patch_size
-        if raw.shape[-1] != expected:
-            raise RuntimeError(f"Unexpected Moirai-2 output dimension: {raw.shape[-1]}")
-        quantiles = raw.reshape(raw.shape[0], future_patches, self.backbone.num_predict_token,
-                                self.backbone.num_quantiles, self.patch_size)[:, :, 0]
-        quantiles = quantiles.permute(0, 2, 1, 3).reshape(raw.shape[0], self.backbone.num_quantiles, -1)
-        prediction = (quantiles * scale[:, 0, 0].view(-1, 1, 1) + loc[:, 0, 0].view(-1, 1, 1))[..., :prediction_length]
+        prediction = self._official_predictions(context, prediction_length)
         loss = None
         if target is not None:
             target = target[..., :prediction_length]
