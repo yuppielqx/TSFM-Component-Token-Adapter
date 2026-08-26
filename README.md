@@ -538,3 +538,203 @@ Electricity 和 Traffic 的正式 rollout 结果需要在对应作业完成后�
 - TS-RAG：实例级检索增强；
 - TS-Memory：外部时间序列记忆增强；
 - 本方法：component-level discrete temporal token adaptation。
+
+## 19. Moirai-2 official-path Component-Token Adapter
+
+本节描述 Moirai-2 版本的实现。它与前文的 ChronosBolt 实验是两套独立
+backbone 实现：共享 Component-Token Adapter 的方法思想，但不共享预测
+wrapper、checkpoint 或 rollout 代码。
+
+### 19.1 本次 Moirai-2 改动
+
+核心文件如下：
+
+```text
+models/moirai2/Moirai2ComponentTokenAdapter.py
+models/moirai2/uni2ts/model/moirai2/forecast.py
+models/moirai2/uni2ts/model/moirai2/__init__.py
+train_moirai2_component_token_adapter.py
+eval_moirai2_component_token_adapter.py
+train_moirai2_component_prototypes.py
+script/train_moirai2_component_codebooks.sh
+```
+
+主要改动包括：
+
+1. 引入 `Moirai2Forecast`，由官方 forecast wrapper 负责输入打包、mask、
+   patch token 构造、递归 token assignment 和 quantile 预测；
+2. 将 adapter 从原先的手工 future-hidden 解码方式改为 official-path hook
+   注入，不再自行复制 Moirai-2 的长预测逻辑；
+3. evaluator 新增 `--rollout_mode official`，并将其设为默认模式；
+4. evaluator 新增 `--disable_adapter`，用于在完全相同的代码路径中运行
+   官方 zero-shot 对照；
+5. code embedding table 使用对应 RQ-VAE prototype 初始化，而不是随机初始化；
+6. residual projection 使用零初始化，使未训练 adapter 从严格 identity 开始；
+7. 预训练 codebook 允许跨数据周期共享。codebook metadata 中的训练周期仅
+   产生 warning，不再阻止 period=7/144 等下游数据；
+8. `script/train_moirai2_component_codebooks.sh` 的 `PYTHONPATH` 已对齐当前
+   `models/moirai2` 目录结构。
+
+### 19.2 为什么称为 official-path
+
+这里的 “official” 指 Moirai-2 的预测过程，而不是指 Component-Token
+Adapter 由 Moirai-2 官方提供。Adapter 是本仓库的方法，backbone forecast
+路径来自 Moirai-2/Uni2TS 的官方实现。
+
+官方路径负责：
+
+- 根据 `context_length` 和 `prediction_length` 构造过去与未来 patch；
+- 构造 `past_observed_target`、`past_is_pad` 和 prediction mask；
+- 保留多条 quantile trajectory 进行长预测；
+- 按官方顺序递归赋值未来 token，并重新计算后续 quantiles；
+- 输出完整的 `(batch, quantile, horizon)` 预测张量。
+
+因此 H=96/192/336/720 都直接交给 `Moirai2Forecast` 完成。代码不会先生成
+一条 median point forecast，再把该点预测手工拼回上下文。`rollout_chunk=64`
+对应 `num_predict_token * patch_size`，只是官方模型一次可赋值的最大未来
+长度，不改变最终 horizon。
+
+两种实验的唯一区别为是否注册 adapter hooks：
+
+```text
+official zero-shot = Moirai2Forecast + frozen Moirai2Module + adapter disabled
+ours               = Moirai2Forecast + frozen Moirai2Module + adapter enabled
+```
+
+当调用 `model.set_adapter_enabled(False)` 或 evaluator 使用
+`--disable_adapter` 时，代码不会注册 pre-hook/encoder-hook，输出就是未修改的
+官方 `Moirai2Forecast` 输出。开发验证中，disabled-adapter 在 H=64 和 H=720
+均与直接调用官方 wrapper 逐元素一致（`max_abs_diff=0`）。
+
+### 19.3 Adapter 如何注入官方预测过程
+
+Moirai-2 backbone 和 component RQ-VAE codebook 始终冻结。一次 official
+module invocation 中，adapter 执行以下步骤：
+
+```text
+official packed target + prediction mask
+    -> 找到每个样本最后一个已知 patch
+    -> 重建最近 512 步 raw context
+    -> trend / seasonal decomposition
+    -> frozen Moirai-2 component encoder
+    -> frozen two-stage RQ quantization
+    -> code + component + stage + position embeddings
+    -> patch-level token aggregator
+    -> component condition tokens
+
+official encoder source hidden state
+    -> cross-attention(query=source hidden, key/value=component tokens)
+    -> gated residual fusion
+    -> 写回同一个 source hidden state
+    -> official output head and recursive quantile forecast
+```
+
+pre-hook 从官方 module 的 `target` 和 `prediction_mask` 中恢复最近的已知上下文。
+在长预测的每次递归调用中，这个上下文都会随已生成未来值更新，因此 component
+condition 也会重新计算。encoder-hook 只修改官方 decoder 实际读取的最后一个
+已知 source state，不改写 future token 的构造与赋值规则。
+
+设 source hidden 为 $h$，component cross-attention 输出为 $a$，注入形式为：
+
+```text
+g  = sigmoid(W_g [h; a] + b_g)
+h' = h + g * W_p(a)
+```
+
+`W_p` 使用零初始化，所以初始化时严格满足 `h' = h`。训练只更新 component
+token embeddings、token aggregator、cross-attention、projection 和 fusion
+gate；Moirai-2 backbone 与 RQ codebook 权重不更新。
+
+### 19.4 共享预训练 codebook 与数据周期
+
+codebook 表示预训练得到的 component prototype space，不为每个下游周期重新
+训练。下游 `period` 只控制 trend/seasonal decomposition；分解后的 component
+仍映射到同一组冻结 prototypes。加载时继续严格检查 backbone、`d_model`、
+`patch_size`、prototype 数量和 tensor shape，但不要求 codebook metadata 的
+训练周期等于下游周期。
+
+当前 Moirai-2 实验周期为：
+
+| Dataset | `freq` | `period` |
+|---|---:|---:|
+| ETTh1 / ETTh2 | `h` | 24 |
+| ETTm1 / ETTm2 | `t` | 96 |
+| Exchange-rate | `d` | 7 |
+| Weather | `t` | 144 |
+| Electricity | `h` | 24 |
+| Traffic | `h` | 24 |
+
+注意：该表是 Moirai-2 实验的实际配置；不要直接套用前文 ChronosBolt 脚本中的
+历史周期设置。
+
+### 19.5 训练与官方可比评测协议
+
+当前严格可比协议为：
+
+```text
+seq_len=512
+train pred_len=64
+components="trend seasonal"
+train_epochs=20
+patience=3
+seed=2021
+evaluation horizons=96 192 336 720
+rollout_mode=official
+rollout_chunk=64
+```
+
+每个数据集使用训练 split 训练一个 64-step adapter，再分别对四个 horizon
+运行完整测试 split。评测 batch size 只影响吞吐量，不改变窗口、预测路径或指标。
+MSE/MAE 均由官方 quantile 输出中最接近 0.5 的 central quantile 计算。
+
+训练示例：
+
+```bash
+python train_moirai2_component_token_adapter.py \
+  --data custom \
+  --root_path ./datasets/exchange_rate/ \
+  --data_path exchange_rate.csv \
+  --features M \
+  --freq d \
+  --seq_len 512 \
+  --pred_len 64 \
+  --component_codebook_dir ./checkpoints/moirai2_component_rqvae \
+  --components "trend seasonal" \
+  --period 7 \
+  --train_epochs 20 \
+  --patience 3 \
+  --batch_size 32 \
+  --checkpoint_dir ./checkpoints/moirai2_exchange_adapter
+```
+
+Adapter 官方路径评测示例：
+
+```bash
+python eval_moirai2_component_token_adapter.py \
+  --data custom \
+  --root_path ./datasets/exchange_rate/ \
+  --data_path exchange_rate.csv \
+  --features M \
+  --freq d \
+  --seq_len 512 \
+  --pred_len 720 \
+  --horizons 720 \
+  --rollout_mode official \
+  --rollout_chunk 64 \
+  --component_codebook_dir ./checkpoints/moirai2_component_rqvae \
+  --adapter_checkpoint ./checkpoints/moirai2_exchange_adapter/adapter_checkpoint.pt \
+  --period 7 \
+  --batch_size 128
+```
+
+在同一 evaluator 中运行官方 zero-shot 时，保持数据与 horizon 参数不变，并
+增加：
+
+```bash
+--disable_adapter
+```
+
+为了保持 apples-to-apples comparison，zero-shot 与 adapter 必须使用相同的
+数据 split、标准化器、`seq_len`、测试窗口、horizon、central quantile 和完整
+测试集；不能将手工 point rollout 的结果与 official quantile rollout 混在同一
+张主结果表中。
