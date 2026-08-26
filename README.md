@@ -738,3 +738,25 @@ python eval_moirai2_component_token_adapter.py \
 数据 split、标准化器、`seq_len`、测试窗口、horizon、central quantile 和完整
 测试集；不能将手工 point rollout 的结果与 official quantile rollout 混在同一
 张主结果表中。
+# TinyTimeMixer 官方预测流程 Adapter
+
+仓库同时提供基于 IBM TinyTimeMixer (TTM) 的 component codebook 与 adapter
+实现：
+
+- `models/tinytimemixer/`：TTM 模型、RQ-VAE codebook 与
+  `TTMComponentTokenAdapter`；
+- `train_ttm_component_codebooks.py`：冻结 TTM backbone，训练通用 component
+  codebook；
+- `train_ttm_component_token_adapter.py`：冻结 TTM 与 codebook，只训练
+  trend/seasonal component-token adapter；
+- `script/run_ttm_ett_adapter.sh` 和 `script/run_ttm_other_adapter.sh`：使用
+  正确数据周期与 TTM frequency token 的单任务入口。
+
+TTM adapter 保留官方预测链路：backbone 后插入 component-token fusion，随后
+继续使用官方 decoder、forecast head 和 inverse scaler。96、192、336、720
+分别加载官方 `512-{horizon}-ft-r2` checkpoint 并训练独立 adapter，不使用
+recursive rollout；四个 horizon 共享同一个冻结的通用 codebook。
+
+参考：[TTM 论文](https://proceedings.neurips.cc/paper_files/paper/2024/file/874a4d89f2d04b4bcf9a2c19545cf040-Paper-Conference.pdf)、
+[IBM 官方实现](https://github.com/ibm-granite/granite-tsfm/tree/main/tsfm_public/models/tinytimemixer)、
+[TTM R2 权重](https://huggingface.co/ibm-research/ttm-research-r2)。
