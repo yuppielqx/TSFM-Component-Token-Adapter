@@ -10,13 +10,13 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 export PYTHONPATH=.
 
-PYTHON_BIN="${PYTHON_BIN:-/home/qingxiangliu/miniforge3/envs/tsrag/bin/python}"
+PYTHON_BIN="${PYTHON_BIN:-python}"
 GPU_ID="${GPU_ID:-0}"
 
 export CUDA_VISIBLE_DEVICES="${GPU_ID}"
 
 "${PYTHON_BIN}" train_component_prototypes.py \
-  --components "trend seasonal residual" \
+  --components "trend seasonal" \
   --pretrained_model_path ./checkpoints/base/ \
   --parquet_path ./datasets/pretrain/retrieval_database_512.parquet \
   --output_dir ./checkpoints/component_rqvae/ \

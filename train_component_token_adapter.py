@@ -39,7 +39,7 @@ def get_args():
 
     parser.add_argument("--pretrained_model_path", type=str, default="./checkpoints/base/")
     parser.add_argument("--component_codebook_dir", type=str, default="./checkpoints/component_rqvae/")
-    parser.add_argument("--components", type=str, default="trend seasonal residual")
+    parser.add_argument("--components", type=str, default="trend seasonal")
     parser.add_argument("--n_proto", type=int, default=256)
     parser.add_argument("--n_rq_stages", type=int, default=2)
     parser.add_argument("--period", type=int, default=24)

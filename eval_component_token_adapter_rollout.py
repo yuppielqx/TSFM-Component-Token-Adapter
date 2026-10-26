@@ -40,7 +40,7 @@ def get_args():
     parser.add_argument("--pretrained_model_path", type=str, default="./checkpoints/base/")
     parser.add_argument("--component_codebook_dir", type=str, default="./checkpoints/component_rqvae/")
     parser.add_argument("--adapter_checkpoint", type=str, required=True)
-    parser.add_argument("--components", type=str, default="trend seasonal residual")
+    parser.add_argument("--components", type=str, default="trend seasonal")
     parser.add_argument("--n_proto", type=int, default=256)
     parser.add_argument("--n_rq_stages", type=int, default=2)
     parser.add_argument("--period", type=int, default=24)
@@ -151,7 +151,8 @@ def main():
     avg_mae = sum(v["mae"] for v in metrics.values()) / len(metrics)
 
     os.makedirs(args.results_dir, exist_ok=True)
-    path = os.path.join(args.results_dir, "ETTh1_component_token_adapter_rollout.txt")
+    stem = os.path.splitext(os.path.basename(args.data_path))[0]
+    path = os.path.join(args.results_dir, f"{stem}_component_token_adapter_rollout.txt")
     with open(path, "w") as handle:
         handle.write(f"data_path={args.data_path}\npercent={args.percent}\nseq_len={args.seq_len}\n")
         handle.write(f"base_prediction_length={model.chronos_config.prediction_length}\n")

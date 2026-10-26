@@ -1,7 +1,29 @@
+# Python and local environments
 __pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+*.egg-info/
+
+# Local operating-system/editor state
+.DS_Store
+._*
+.vscode/
+.idea/
+.env
+.env.*
+
+# External data, weights, and experiment outputs
 datasets/
-wandb/
-results/
 checkpoints/
-retrieval_database/
+results/
 logs/
+artifacts/
+runs/
+wandb/
+retrieval_database/
+*.log
+*.pt
+*.pth
+*.safetensors

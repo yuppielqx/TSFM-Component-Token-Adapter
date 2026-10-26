@@ -1,17 +1,11 @@
-# Core runtime for the Component-Token Adapter pipeline.
-# Install the CUDA-matched PyTorch build separately when needed.
-torch>=2.6,<2.7
+# Install a hardware-appropriate PyTorch wheel if the default is unsuitable.
+torch>=2.5,<2.7
+# Local Chronos-Bolt uses the T5 internals from this release series.
 transformers>=4.49,<4.50
-safetensors>=0.7,<0.8
-
-# Data loading and preprocessing
-numpy>=2.0,<2.1
-pandas>=2.2,<2.3
-pyarrow>=21,<22
-scikit-learn>=1.6,<1.7
-statsmodels>=0.14,<0.15
-matplotlib>=3.9,<4
-tqdm>=4.67,<5
-
-# Used by the T5/Chronos model implementation and parquet/data utilities.
-sentencepiece>=0.2,<0.3
+numpy>=1.26,<3
+pandas>=2.2,<4
+pyarrow>=15,<25
+scikit-learn>=1.5,<2
+safetensors>=0.4,<0.9
+tqdm>=4.66,<5
+huggingface-hub>=0.28,<1

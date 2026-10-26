@@ -54,8 +54,8 @@ def parse_components(text: str):
 
 def get_args():
     parser = argparse.ArgumentParser(description="Train component-wise RQ-VAE prototypes")
-    parser.add_argument("--components", type=str, default="trend seasonal residual")
-    parser.add_argument("--pretrained_model_path", type=str, default="./checkpoints/chronosbolt-base")
+    parser.add_argument("--components", type=str, default="trend seasonal")
+    parser.add_argument("--pretrained_model_path", type=str, default="./checkpoints/base/")
     parser.add_argument("--parquet_path", type=str, default="./datasets/pretrain/retrieval_database_512.parquet")
     parser.add_argument("--output_dir", type=str, default="./checkpoints/component_rqvae/")
     parser.add_argument("--checkpoint_dir", type=str, default="./checkpoints/component_proto_ckpt/")
