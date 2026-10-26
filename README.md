@@ -38,7 +38,9 @@ python -m unittest discover -s tests -v
 
 The local CPU validation used PyTorch 2.5.1 and Transformers 4.49.0. Keep
 Transformers on 4.49.x because this implementation uses T5 internal APIs.
-The standard local-checkpoint workflow does not require AutoGluon or GluonTS.
+The implementation does not require AutoGluon or GluonTS. Model loading uses
+local checkpoint directories or Hugging Face; download S3-hosted files locally
+before use.
 
 ## Prepare model and data
 

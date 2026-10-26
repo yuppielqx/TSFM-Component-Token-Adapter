@@ -123,7 +123,6 @@ class BaseChronosPipeline(metaclass=PipelineRegistry):
         cls,
         pretrained_model_name_or_path: Union[str, Path],
         *model_args,
-        force=False,
         **kwargs,
     ):
         """
@@ -131,16 +130,13 @@ class BaseChronosPipeline(metaclass=PipelineRegistry):
         Supports the same arguments as ``AutoConfig`` and ``AutoModel``
         from ``transformers``.
 
-        When a local path is provided, supports both a folder or a .tar.gz archive.
+        Local checkpoints must be directories containing the model config and weights.
         """
         from transformers import AutoConfig
 
         kwargs.setdefault("resume_download", None)  # silence huggingface_hub warning
         if str(pretrained_model_name_or_path).startswith("s3://"):
-            from .utils import cache_model_from_s3
-
-            local_model_path = cache_model_from_s3(str(pretrained_model_name_or_path), force=force)
-            return cls.from_pretrained(local_model_path, *model_args, **kwargs)
+            raise ValueError("Download S3 checkpoints locally first, or use a Hugging Face model ID.")
 
         torch_dtype = kwargs.get("torch_dtype", "auto")
         if torch_dtype != "auto" and isinstance(torch_dtype, str):
